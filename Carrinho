@@ -1,0 +1,87 @@
+"""Integração com VTEX OrderForm API — add to cart."""
+from typing import Optional
+import httpx
+from config import VTEX_BASE_URL
+
+
+async def get_order_form(vtex_session: Optional[str]) -> Optional[str]:
+    """Obtém ou cria um orderFormId para a sessão do cliente."""
+    cookies = {"vtex_session": vtex_session} if vtex_session else {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.get(
+                f"{VTEX_BASE_URL}/api/checkout/pub/orderForm",
+                cookies=cookies,
+                headers={"Accept": "application/json"},
+            )
+            return r.json().get("orderFormId")
+    except Exception as e:
+        print(f"⚠️  OrderForm: {e}")
+        return None
+
+
+async def validar_sku(id_sku: str) -> bool:
+    """Verifica se o SKU está ativo na VTEX."""
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as http:
+            r = await http.get(
+                f"{VTEX_BASE_URL}/api/catalog_system/pub/sku/stockkeepingunitbyid/{id_sku}",
+                headers={"Accept": "application/json"},
+            )
+            return r.json().get("IsActive", False)
+    except Exception:
+        return True  # em dúvida, tenta adicionar
+
+
+async def adicionar_item(
+    order_form_id: str,
+    id_sku:        str,
+    quantidade:    int,
+    vtex_session:  Optional[str],
+) -> bool:
+    """Adiciona o item ao carrinho. Retorna True se sucesso."""
+    url     = f"{VTEX_BASE_URL}/api/checkout/pub/orderForm/{order_form_id}/items"
+    payload = {"orderItems": [{"id": id_sku, "quantity": quantidade, "seller": "1"}]}
+    cookies = {"vtex_session": vtex_session} if vtex_session else {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.post(
+                url, json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                cookies=cookies,
+            )
+            ok = resp.status_code in (200, 201)
+            if not ok:
+                print(f"⚠️  Add item {resp.status_code}: {resp.text[:200]}")
+            return ok
+    except Exception as e:
+        print(f"❌ Adicionar item: {e}")
+        return False
+
+
+async def ver_carrinho(vtex_session: Optional[str]) -> dict:
+    """Retorna dados do carrinho atual."""
+    cookies = {"vtex_session": vtex_session} if vtex_session else {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.get(
+                f"{VTEX_BASE_URL}/api/checkout/pub/orderForm",
+                cookies=cookies,
+                headers={"Accept": "application/json"},
+            )
+            data = r.json()
+        return {
+            "order_form_id": data.get("orderFormId"),
+            "total_itens":   len(data.get("items", [])),
+            "valor_total":   data.get("value", 0) / 100,
+            "itens": [{
+                "nome":       i.get("name"),
+                "quantidade": i.get("quantity"),
+                "preco":      i.get("price", 0) / 100,
+                "imagem":     i.get("imageUrl"),
+                "sku":        i.get("id"),
+            } for i in data.get("items", [])],
+            "checkout_url": f"{VTEX_BASE_URL}/checkout#/cart",
+        }
+    except Exception as e:
+        return {"erro": str(e)}
