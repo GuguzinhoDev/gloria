@@ -1,0 +1,25 @@
+"""Configuração central da aplicação."""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# IA
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL",   "gemini-2.0-flash")
+EMBED_MODEL    = os.getenv("EMBED_MODEL",    "text-embedding-004")
+
+# VTEX
+VTEX_BASE_URL  = os.getenv("VTEX_BASE_URL",  "https://www.constance.com.br")
+
+# Redis
+REDIS_URL      = os.getenv("REDIS_URL",      "redis://localhost:6379")
+SESSION_TTL    = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
+
+# ChromaDB
+CHROMA_PATH    = os.getenv("CHROMA_PATH",    "./vector_db")
+CHROMA_COLLECTION = "produtos_gloria"
+
+# App
+PRODUTOS_JSON  = os.getenv("PRODUTOS_JSON",  "produtos.json")
+ANALYTICS_FILE = os.getenv("ANALYTICS_FILE", "analytics.jsonl")
