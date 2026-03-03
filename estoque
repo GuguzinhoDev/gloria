@@ -1,0 +1,100 @@
+"""Consulta de estoque e tamanhos via API VTEX."""
+import re
+from typing import Dict, List, Optional
+
+import httpx
+from config import VTEX_BASE_URL
+
+_cache: Dict[str, Dict[str, int]] = {}
+
+
+async def buscar_estoque(id_produto: str) -> Dict[str, int]:
+    """Retorna {tamanho: quantidade} com qty > 1."""
+    if id_produto in _cache:
+        return _cache[id_produto]
+
+    url = (f"{VTEX_BASE_URL}/api/catalog_system/pub/products/search"
+           f"?fq=productId:{id_produto}&_from=0&_to=0")
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.get(url, headers={"Accept": "application/json",
+                                             "User-Agent": "GlorIA/2.0"})
+            r.raise_for_status()
+            dados = r.json()
+    except Exception as e:
+        print(f"⚠️  Estoque VTEX {id_produto}: {e}")
+        _cache[id_produto] = {}
+        return {}
+
+    estoque: Dict[str, int] = {}
+    try:
+        for item in (dados[0].get("items", []) if dados else []):
+            tam = _extrair_tamanho(item)
+            if not tam:
+                continue
+            qtd = sum(s.get("commertialOffer",{}).get("AvailableQuantity",0)
+                      for s in item.get("sellers",[]))
+            if qtd > 1:
+                estoque[tam] = qtd
+    except Exception as e:
+        print(f"⚠️  Parse estoque {id_produto}: {e}")
+
+    _cache[id_produto] = estoque
+    return estoque
+
+
+def _extrair_tamanho(item: Dict) -> Optional[str]:
+    for spec in item.get("variations", []):
+        if any(x in spec.get("name","").lower()
+               for x in ["tamanho","tam","size","numero","numeração"]):
+            vals = spec.get("values", [])
+            return str(vals[0]) if vals else None
+    m = re.search(r"\b([3-4][0-9])\b", item.get("name",""))
+    return m.group(1) if m else None
+
+
+def tamanhos_da_descricao(desc: str) -> List[str]:
+    text = re.sub(r"<[^>]+>", " ", desc or "")
+    m    = re.search(
+        r"(?:do\s+(?:tamanho\s+)?|de\s+(?:tamanho\s+)?)(\d{2})"
+        r"(?:\s+(?:ao?|até|a)\s+(?:o\s+)?)(\d{2})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        ini, fim = int(m.group(1)), int(m.group(2))
+        if 30 <= ini <= 49 and ini <= fim:
+            return [str(n) for n in range(ini, fim + 1)]
+    nums = re.findall(r"\b([3-4][0-9])\b", text)
+    return sorted(dict.fromkeys(nums), key=int) if nums else []
+
+
+async def enriquecer(produtos: List[Dict]) -> List[Dict]:
+    for p in produtos:
+        try:
+            id_p     = str(p.get("idProduto",""))
+            tamanhos: List[str] = []
+            fonte    = "vtex_api"
+
+            if id_p:
+                ev = await buscar_estoque(id_p)
+                if ev:
+                    try:
+                        tamanhos = sorted(ev.keys(), key=lambda x: int(re.sub(r"\D","",x)))
+                    except Exception:
+                        tamanhos = sorted(ev.keys())
+
+            if not tamanhos:
+                tamanhos = tamanhos_da_descricao(p.get("description",""))
+                fonte    = "descricao_estimado"
+
+            p["tamanhos_disponiveis"] = tamanhos
+            p["tamanhos_fonte"]       = fonte
+        except Exception as e:
+            print(f"⚠️  Tamanhos {p.get('idProduto')}: {e}")
+            p.setdefault("tamanhos_disponiveis", [])
+            p.setdefault("tamanhos_fonte", "erro")
+    return produtos
+
+
+def invalidar_cache() -> None:
+    _cache.clear()
