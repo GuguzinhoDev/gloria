@@ -1,0 +1,103 @@
+"""Léxico fashion brasileiro — sinônimos, ocasiões, estilos e materiais."""
+from typing import Dict, List
+
+SINONIMOS_PRODUTO: Dict[str, List[str]] = {
+    "mule":      ["mule", "mules", "tamanco", "slide", "slipper"],
+    "scarpin":   ["scarpin", "scarpen", "pump", "stiletto", "salto alto", "salto fino", "salto agulha"],
+    "sapatilha": ["sapatilha", "flat", "bailarina", "ballerina", "sapatilha bico fino"],
+    "sandalia":  ["sandalia", "sandália", "rasteira", "anabela", "plataforma", "salto bloco", "tiras"],
+    "tenis":     ["tenis", "tênis", "sneaker", "snaker", "chunky", "dad shoe"],
+    "bota":      ["bota", "botas", "botinha", "ankle boot", "over the knee", "cano alto", "cano curto"],
+    "bolsa":     ["bolsa", "bag", "tote", "clutch", "pochete", "carteira", "tiracolo", "mochila", "shoulder bag"],
+    "chinelo":   ["chinelo", "flip flop", "slide aberto", "tamanco aberto"],
+    "mocassim":  ["mocassim", "loafer", "driver", "penny loafer"],
+    "oxford":    ["oxford", "derbies", "brogues", "sapato clássico"],
+}
+
+SINONIMOS_COR: Dict[str, List[str]] = {
+    "preto":    ["preto", "preta", "black", "escuro", "carvao", "onix"],
+    "branco":   ["branco", "branca", "white", "off white", "offwhite", "creme", "marfim", "perola", "gelo"],
+    "nude":     ["nude", "caramelo", "areia", "bege", "pele", "natural", "champagne", "sand", "cru"],
+    "caramelo": ["caramelo", "nude", "bege", "tan", "cognac", "mel", "ambar", "whisky", "camel"],
+    "marrom":   ["marrom", "brown", "chocolate", "tabaco", "terra", "mogno", "castanho"],
+    "vermelho": ["vermelho", "red", "tomate", "scarlet", "rubi", "cereja"],
+    "vinho":    ["vinho", "bordo", "marsala", "burgundy", "oxblood", "ameixa escuro"],
+    "rosa":     ["rosa", "pink", "blush", "rose", "rosê", "coral claro", "quartzo"],
+    "azul":     ["azul", "blue", "navy", "marinho", "safira", "cobalto", "celeste", "royal"],
+    "verde":    ["verde", "green", "esmeralda", "menta", "sage", "musgo", "oliva", "militar"],
+    "dourado":  ["dourado", "gold", "metalico", "bronze", "ouro", "dourado velho"],
+    "prata":    ["prata", "silver", "prateado", "metalico", "cromado"],
+    "cinza":    ["cinza", "grey", "gray", "chumbo", "grafite", "ardosia"],
+    "laranja":  ["laranja", "orange", "terracota", "ferrugem", "oxido", "abobora"],
+    "amarelo":  ["amarelo", "yellow", "mostarda", "mel claro", "banana", "limon"],
+    "lilas":    ["lilas", "lavanda", "lavender", "ametista", "roxo claro"],
+    "roxo":     ["roxo", "purple", "violeta", "uva"],
+    "rafia":    ["rafia", "palha", "trancado", "trama", "sisal", "natural"],
+    "animal":   ["animal print", "zebra", "oncinha", "leopardo", "cobra", "croco", "reptil"],
+}
+
+OCASIAO_CONTEXTO: Dict[str, Dict] = {
+    "trabalho": {
+        "tipos":   ["scarpin", "sapatilha", "mule", "mocassim", "oxford", "bota", "scarpen"],
+        "estilos": ["elegante", "classico", "sofisticado", "formal", "office", "alfaiataria",
+                    "profissional", "neutro", "minimalista", "refinado"],
+        "evitar":  ["chinelo", "flip flop", "havaianas"],
+    },
+    "casual": {
+        "tipos":   ["sapatilha", "tenis", "sandalia", "mule", "chinelo"],
+        "estilos": ["conforto", "pratico", "dia a dia", "leve", "versatil", "despojado"],
+        "evitar":  [],
+    },
+    "festa": {
+        "tipos":   ["scarpin", "sandalia", "mule"],
+        "estilos": ["brilho", "metalico", "elegante", "glamour", "salto", "festa",
+                    "noite", "balada", "formatura", "sofisticado", "chamativo"],
+        "evitar":  ["tenis", "chinelo", "rasteira simples"],
+    },
+    "praia": {
+        "tipos":   ["sandalia", "chinelo", "rasteira"],
+        "estilos": ["leve", "verao", "praia", "piscina", "resort", "colorido"],
+        "evitar":  ["salto", "couro", "bota", "oxford"],
+    },
+    "esporte": {
+        "tipos":   ["tenis"],
+        "estilos": ["esportivo", "atletico", "conforto", "amortecimento", "performance"],
+        "evitar":  ["salto", "mule", "sandalia fina", "scarpin"],
+    },
+    "passeio": {
+        "tipos":   ["sapatilha", "tenis", "sandalia", "mule"],
+        "estilos": ["conforto", "versatil", "casual", "dia", "pratico"],
+        "evitar":  [],
+    },
+    "geral": {
+        "tipos":   [],
+        "estilos": ["versatil", "classico", "atemporal"],
+        "evitar":  [],
+    },
+}
+
+PALAVRAS_ESTILO: Dict[str, List[str]] = {
+    "elegante":    ["elegante", "elegancia", "sofisticado", "refinado", "chique", "chic",
+                    "classico", "atemporal", "luxo", "fino"],
+    "confortavel": ["conforto", "confortavel", "flex", "macio", "palmilha", "solado macio",
+                    "anatomico", "acolchoado", "leve", "pratico", "forro"],
+    "moderno":     ["moderno", "contemporaneo", "tendencia", "trend", "fashion", "atual",
+                    "urbano", "street", "hype"],
+    "romantico":   ["romantico", "delicado", "feminino", "gracioso", "floral", "laco", "bordado"],
+    "despojado":   ["despojado", "descontraido", "casual", "boho", "bohemio", "relaxado"],
+    "minimalista": ["minimalista", "clean", "simples", "neutro", "discreto", "basico"],
+    "bold":        ["bold", "marcante", "chamativo", "statement", "destaque", "diferenciado",
+                    "colorido", "estampado", "exclusivo"],
+    "sustentavel": ["natural", "vegano", "eco", "sustentavel", "artesanal", "handmade"],
+}
+
+MATERIAIS: Dict[str, List[str]] = {
+    "couro":    ["couro", "leather", "napa", "couro legitimo", "couro ecologico"],
+    "verniz":   ["verniz", "patent", "envernizado", "brilhante", "espelhado"],
+    "tecido":   ["tecido", "tela", "lona", "jeans", "algodao"],
+    "rafia":    ["rafia", "palha", "trancado", "trama", "sisal"],
+    "metalico": ["metalico", "metálico", "glitter", "brilho", "lurex"],
+    "camurca":  ["camurca", "suede", "nobuck", "aveludado"],
+    "cetim":    ["cetim", "satin", "acetinado"],
+    "croche":   ["croche", "crochet", "rendado", "trama artesanal"],
+}
