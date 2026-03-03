@@ -1,0 +1,886 @@
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  GlorIA — Motor de Busca + VTEX Cart                                 ║
+║  Arquivo único para testes                                           ║
+║                                                                      ║
+║  Contém APENAS:                                                      ║
+║    • Léxico fashion brasileiro                                       ║
+║    • Motor híbrido: vetorial + BM25 + heurístico + re-rank Gemini   ║
+║    • Memória de sessão (Redis, opcional)                             ║
+║    • VTEX: estoque, tamanhos, add to cart                            ║
+║                                                                      ║
+║  Instalação mínima (funciona sem vetorial/Redis):                    ║
+║    pip install fastapi uvicorn httpx python-dotenv google-genai      ║
+║    python-multipart Pillow                                           ║
+║                                                                      ║
+║  Instalação completa:                                                ║
+║    pip install chromadb rank-bm25 redis                             ║
+║                                                                      ║
+║  Rodar:                                                              ║
+║    uvicorn motor_test:app --reload --port 8000                       ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
+# ── Stdlib ────────────────────────────────────────────────────────────────────
+import os, re, json, unicodedata, traceback
+from collections import defaultdict
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+# ── Third-party ───────────────────────────────────────────────────────────────
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from google import genai
+from google.genai.types import GenerateContentConfig
+from PIL import Image
+import io
+from pydantic import BaseModel
+
+load_dotenv()
+
+# ── Opcionais ─────────────────────────────────────────────────────────────────
+try:
+    import chromadb;     CHROMA = True
+except ImportError:
+    CHROMA = False;      print("ℹ️  chromadb ausente — busca heurística ativa. pip install chromadb")
+
+try:
+    from rank_bm25 import BM25Okapi; BM25 = True
+except ImportError:
+    BM25 = False;        print("ℹ️  rank-bm25 ausente. pip install rank-bm25")
+
+try:
+    import redis.asyncio as aioredis; REDIS = True
+except ImportError:
+    REDIS = False;       print("ℹ️  redis ausente — sessão em memória local. pip install redis")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL",   "gemini-2.0-flash")
+EMBED_MODEL    = os.getenv("EMBED_MODEL",    "text-embedding-004")
+VTEX_BASE      = os.getenv("VTEX_BASE_URL",  "https://www.constance.com.br")
+REDIS_URL      = os.getenv("REDIS_URL",      "redis://localhost:6379")
+SESSION_TTL    = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
+CHROMA_PATH    = os.getenv("CHROMA_PATH",    "./vector_db")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY não definida no .env")
+
+gemini = genai.Client(api_key=GEMINI_API_KEY)
+
+app = FastAPI(title="GlorIA Motor", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AddCarrinhoRequest(BaseModel):
+    id_sku:     str
+    quantidade: int = 1
+    session_id: Optional[str] = None
+
+class AddCarrinhoResponse(BaseModel):
+    sucesso:       bool
+    checkout_url:  Optional[str] = None
+    order_form_id: Optional[str] = None
+    mensagem:      str
+
+class RespostaMotor(BaseModel):
+    status:        str
+    interpretacao: Dict[str, Any]
+    produtos:      List[Dict[str, Any]]
+    proxima_acao:  str
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LÉXICO FASHION BRASILEIRO
+# ══════════════════════════════════════════════════════════════════════════════
+
+TIPOS: Dict[str, List[str]] = {
+    "mule":      ["mule", "mules", "tamanco", "slide", "slipper"],
+    "scarpin":   ["scarpin", "scarpen", "pump", "stiletto", "salto alto", "salto fino", "salto agulha"],
+    "sapatilha": ["sapatilha", "flat", "bailarina", "ballerina", "sapatilha bico fino"],
+    "sandalia":  ["sandalia", "sandália", "rasteira", "anabela", "plataforma", "salto bloco", "tiras"],
+    "tenis":     ["tenis", "tênis", "sneaker", "snaker", "chunky", "dad shoe"],
+    "bota":      ["bota", "botas", "botinha", "ankle boot", "over the knee", "cano alto", "cano curto"],
+    "bolsa":     ["bolsa", "bag", "tote", "clutch", "pochete", "carteira", "tiracolo", "mochila", "shoulder bag"],
+    "chinelo":   ["chinelo", "flip flop", "slide aberto"],
+    "mocassim":  ["mocassim", "loafer", "driver", "penny loafer"],
+    "oxford":    ["oxford", "derbies", "brogues", "sapato clássico"],
+}
+
+CORES: Dict[str, List[str]] = {
+    "preto":    ["preto", "preta", "black", "escuro", "carvao", "onix"],
+    "branco":   ["branco", "branca", "white", "off white", "offwhite", "creme", "marfim", "perola", "gelo"],
+    "nude":     ["nude", "caramelo", "areia", "bege", "pele", "natural", "champagne", "sand", "cru"],
+    "caramelo": ["caramelo", "nude", "bege", "tan", "cognac", "mel", "ambar", "whisky", "camel"],
+    "marrom":   ["marrom", "brown", "chocolate", "tabaco", "terra", "mogno", "castanho"],
+    "vermelho": ["vermelho", "red", "tomate", "scarlet", "rubi", "cereja"],
+    "vinho":    ["vinho", "bordo", "marsala", "burgundy", "oxblood", "ameixa escuro"],
+    "rosa":     ["rosa", "pink", "blush", "rose", "rosê", "coral claro", "quartzo"],
+    "azul":     ["azul", "blue", "navy", "marinho", "safira", "cobalto", "celeste", "royal"],
+    "verde":    ["verde", "green", "esmeralda", "menta", "sage", "musgo", "oliva", "militar"],
+    "dourado":  ["dourado", "gold", "metalico", "bronze", "ouro", "dourado velho"],
+    "prata":    ["prata", "silver", "prateado", "metalico", "cromado"],
+    "cinza":    ["cinza", "grey", "gray", "chumbo", "grafite", "ardosia"],
+    "laranja":  ["laranja", "orange", "terracota", "ferrugem", "oxido", "abobora"],
+    "amarelo":  ["amarelo", "yellow", "mostarda", "mel claro", "banana", "limon"],
+    "lilas":    ["lilas", "lavanda", "lavender", "ametista", "roxo claro"],
+    "roxo":     ["roxo", "purple", "violeta", "uva"],
+    "rafia":    ["rafia", "palha", "trancado", "trama", "sisal"],
+    "animal":   ["animal print", "zebra", "oncinha", "leopardo", "cobra", "croco"],
+}
+
+OCASIOES: Dict[str, Dict] = {
+    "trabalho": {
+        "tipos":   ["scarpin", "sapatilha", "mule", "mocassim", "oxford", "bota"],
+        "estilos": ["elegante", "classico", "sofisticado", "formal", "office", "alfaiataria",
+                    "profissional", "neutro", "minimalista", "refinado"],
+        "evitar":  ["chinelo", "flip flop"],
+    },
+    "casual": {
+        "tipos":   ["sapatilha", "tenis", "sandalia", "mule", "chinelo"],
+        "estilos": ["conforto", "pratico", "dia a dia", "leve", "versatil", "despojado"],
+        "evitar":  [],
+    },
+    "festa": {
+        "tipos":   ["scarpin", "sandalia", "mule"],
+        "estilos": ["brilho", "metalico", "elegante", "glamour", "salto", "festa",
+                    "noite", "balada", "formatura", "sofisticado"],
+        "evitar":  ["tenis", "chinelo"],
+    },
+    "praia":   {"tipos": ["sandalia","chinelo","rasteira"], "estilos": ["leve","verao","praia","resort","colorido"], "evitar": ["salto","bota","oxford"]},
+    "esporte": {"tipos": ["tenis"], "estilos": ["esportivo","atletico","conforto","performance"], "evitar": ["salto","mule","scarpin"]},
+    "passeio": {"tipos": ["sapatilha","tenis","sandalia","mule"], "estilos": ["conforto","versatil","casual","dia"], "evitar": []},
+    "geral":   {"tipos": [], "estilos": ["versatil","classico","atemporal"], "evitar": []},
+}
+
+ESTILOS: Dict[str, List[str]] = {
+    "elegante":    ["elegante","elegancia","sofisticado","refinado","chique","chic","classico","atemporal","luxo","fino"],
+    "confortavel": ["conforto","confortavel","flex","macio","palmilha","solado macio","anatomico","acolchoado","leve","pratico"],
+    "moderno":     ["moderno","contemporaneo","tendencia","trend","fashion","atual","urbano","street","hype"],
+    "romantico":   ["romantico","delicado","feminino","gracioso","floral","laco","bordado"],
+    "despojado":   ["despojado","descontraido","casual","boho","bohemio","relaxado"],
+    "minimalista": ["minimalista","clean","simples","neutro","discreto","basico"],
+    "bold":        ["bold","marcante","chamativo","statement","destaque","diferenciado","colorido","estampado"],
+    "sustentavel": ["natural","vegano","eco","sustentavel","artesanal","handmade"],
+}
+
+MATERIAIS: Dict[str, List[str]] = {
+    "couro":    ["couro","leather","napa","couro legitimo"],
+    "verniz":   ["verniz","patent","envernizado","brilhante","espelhado"],
+    "tecido":   ["tecido","tela","lona","jeans","algodao"],
+    "rafia":    ["rafia","palha","trancado","trama","sisal"],
+    "metalico": ["metalico","glitter","brilho","lurex"],
+    "camurca":  ["camurca","suede","nobuck","aveludado"],
+    "cetim":    ["cetim","satin","acetinado"],
+    "croche":   ["croche","crochet","rendado"],
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def n(txt: str) -> str:
+    """Normaliza: minúsculo + sem acento."""
+    if not isinstance(txt, str): return ""
+    t = unicodedata.normalize("NFD", txt.lower().strip())
+    return "".join(c for c in t if unicodedata.category(c) != "Mn")
+
+def tokens(txt: str) -> List[str]:
+    return list(set(re.findall(r"[a-z]{3,}", n(txt))))
+
+def html(txt: str) -> str:
+    return re.sub(r"<[^>]+>", " ", txt or "")
+
+def xtipo(tipo: str) -> List[str]:
+    t = n(tipo)
+    for k, vs in TIPOS.items():
+        if t in [n(v) for v in vs] or t == n(k): return [n(v) for v in vs]
+    return [t]
+
+def xcor(cor: str) -> List[str]:
+    c = n(cor)
+    for k, vs in CORES.items():
+        if c in [n(v) for v in vs] or c == n(k): return [n(v) for v in vs]
+    return [c]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRÉ-PROCESSAMENTO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _preco(txt: str) -> float:
+    try:    return float(re.sub(r"[^\d,]", "", txt or "0").replace(",", "."))
+    except: return 0.0
+
+def prep(p: Dict) -> Dict:
+    nome  = p.get("name", "")
+    desc  = html(p.get("description", ""))
+    texto = f"{nome} {desc} {p.get('categoryid1','')} {p.get('categoryid2','')}"
+    p["_tok"]    = tokens(texto)
+    p["_txt"]    = n(texto)
+    p["_tipo"]   = n(p.get("categoryid2") or p.get("categoryid1") or "")
+    p["_embed"]  = f"{nome}. {p.get('categoryid2','')}. {desc[:300]}"
+    p_o = _preco(p.get("price_original","0")); p_a = _preco(p.get("price","0"))
+    p["_desc"]   = p_a > 0 and p_a < p_o * 0.95
+    p["_stock"]  = n(p.get("instock","")) in ["disponivel","disponível","em estoque","true","1"]
+    return p
+
+_estoque: Optional[List[Dict]] = None
+
+def carregar_estoque() -> List[Dict]:
+    global _estoque
+    if _estoque: return _estoque
+    try:
+        path = os.path.join(os.path.dirname(__file__), "produtos.json")
+        data = json.load(open(path, encoding="utf-8"))
+        try:    raw = data[0]["json"]["Mm"]["product"]
+        except: raw = data if isinstance(data, list) else []
+        _estoque = [prep(p) for p in raw]
+        print(f"✅ {len(_estoque)} produtos carregados")
+        return _estoque
+    except Exception as e:
+        print(f"❌ Estoque: {e}"); return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BM25
+# ══════════════════════════════════════════════════════════════════════════════
+
+_bm25     = None
+_bm25_ids: List[str] = []
+
+def init_bm25(estoque: List[Dict]) -> None:
+    global _bm25, _bm25_ids
+    if not BM25: return
+    _bm25_ids = [str(p.get("idProduto","")) for p in estoque]
+    _bm25     = BM25Okapi([p["_tok"] for p in estoque])
+    print(f"✅ BM25: {len(_bm25_ids)} docs")
+
+def busca_bm25(query: str, k: int = 25) -> List[Tuple[str, float]]:
+    if not _bm25: return []
+    sc = _bm25.get_scores(tokens(query))
+    return [(_bm25_ids[i], float(s)) for i, s in sorted(enumerate(sc), key=lambda x: -x[1])[:k] if s > 0]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VETORIAL (ChromaDB)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_col = None
+
+def get_col():
+    global _col
+    if _col: return _col
+    if not CHROMA: return None
+    try:
+        db   = chromadb.PersistentClient(path=CHROMA_PATH)
+        _col = db.get_or_create_collection("gloria", metadata={"hnsw:space": "cosine"})
+        return _col
+    except Exception as e:
+        print(f"⚠️  ChromaDB: {e}"); return None
+
+async def indexar(estoque: List[Dict]) -> int:
+    col = get_col()
+    if not col: return 0
+    existentes  = set(col.get(include=[])["ids"])
+    faltando    = [p for p in estoque if str(p.get("idProduto","")) not in existentes]
+    if not faltando:
+        print(f"✅ Vetorial: {len(existentes)} já indexados"); return len(existentes)
+    total = 0
+    for i in range(0, len(faltando), 100):
+        lote   = faltando[i:i+100]
+        textos = [p["_embed"] for p in lote]
+        ids    = [str(p["idProduto"]) for p in lote]
+        metas  = [{"tipo": p["_tipo"], "disponivel": str(p["_stock"])} for p in lote]
+        try:
+            resp = gemini.models.embed_content(model=EMBED_MODEL, content=textos)
+            col.add(ids=ids, embeddings=[e.values for e in resp.embeddings],
+                    documents=textos, metadatas=metas)
+            total += len(lote)
+        except Exception as e:
+            print(f"⚠️  Embed lote {i}: {e}")
+    print(f"✅ Vetorial: {total} indexados"); return total
+
+async def busca_vetorial(query: str, k: int = 25) -> List[Tuple[str, float]]:
+    col = get_col()
+    if not col or col.count() == 0: return []
+    try:
+        emb     = gemini.models.embed_content(model=EMBED_MODEL, content=query).embeddings[0].values
+        res     = col.query(query_embeddings=[emb], n_results=min(k, col.count()), include=["distances"])
+        return list(zip(res["ids"][0], [1.0 - d/2.0 for d in res["distances"][0]]))
+    except Exception as e:
+        print(f"⚠️  Vetorial: {e}"); return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RECIPROCAL RANK FUSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rrf(rankings: List[List[Tuple[str, float]]], k: int = 60) -> List[Tuple[str, float]]:
+    sc: Dict[str, float] = defaultdict(float)
+    for ranking in rankings:
+        for pos, (doc_id, _) in enumerate(ranking):
+            sc[doc_id] += 1.0 / (k + pos + 1)
+    return sorted(sc.items(), key=lambda x: -x[1])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCORING HEURÍSTICO (7 CAMADAS — fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def score(p: Dict, ctx: Dict) -> int:
+    sc = 0
+    tok = set(p["_tok"]); txt = p["_txt"]
+    oc  = n(ctx.get("ocasiao","geral"))
+    tip = n(ctx.get("tipo_produto") or "")
+
+    # 1. Tipo + sinônimos (max 60)
+    if tip:
+        for s in xipo(tip):
+            if s in txt: sc += 60 if s == tip else 45; break
+
+    # 2. Ocasião (max 40)
+    c = OCASIOES.get(oc, OCASIOES["geral"])
+    if any(n(t) in txt for t in c["tipos"]): sc += 25
+    sc += min(sum(1 for e in c["estilos"] if n(e) in txt) * 5, 15)
+    if any(n(e) in txt for e in c["evitar"] if len(e) > 3): sc -= 30
+
+    # 3. Cor + paleta (max 35)
+    pc = 0
+    for cor in ctx.get("cores",[]):
+        for tom in xcor(cor):
+            if tom in txt: pc += 35; break
+    sc += min(pc, 35)
+
+    # 4. Keywords (max 50)
+    pk = 0
+    for kw in [n(k) for k in ctx.get("palavras_chave",[])]:
+        if kw in tok: pk += 20
+        elif len(kw) > 4 and kw in txt: pk += 10
+        else:
+            for grp, pals in ESTILOS.items():
+                if kw in [n(p) for p in pals] and any(n(p) in tok for p in pals):
+                    pk += 8; break
+    sc += min(pk, 50)
+
+    # 5. Estilo (max 20)
+    est = n(ctx.get("estilo_cliente",""))
+    for grp, pals in ESTILOS.items():
+        if est in [n(p) for p in pals]:
+            if any(n(p) in tok for p in pals): sc += 20
+            break
+
+    # 6. Material (max 15)
+    kws = [n(k) for k in ctx.get("palavras_chave",[])]
+    for grp, pals in MATERIAIS.items():
+        if any(n(p) in kws for p in pals) and any(n(p) in tok for p in pals):
+            sc += 15; break
+
+    # 7. Boosts (max 25)
+    if p.get("_stock"): sc += 10
+    if p.get("_desc"):  sc += 15
+
+    return sc
+
+# Corrige nome da função que estava errado acima
+def xipo(tipo: str) -> List[str]:
+    return xtype(tipo)
+
+def xtype(tipo: str) -> List[str]:
+    t = n(tipo)
+    for k, vs in TIPOS.items():
+        if t in [n(v) for v in vs] or t == n(k): return [n(v) for v in vs]
+    return [t]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RE-RANKING GEMINI
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def rerank(cands: List[Dict], ctx: Dict) -> List[Dict]:
+    if len(cands) <= 3: return cands[:6]
+    resumo = [{"idx": i, "nome": p.get("name",""),
+                "cat": f"{p.get('categoryid1','')} / {p.get('categoryid2','')}",
+                "desc": html(p.get("description",""))[:180],
+                "preco": p.get("price",""), "desc_flag": p.get("_desc",False)}
+               for i, p in enumerate(cands)]
+    prompt = (f"Motor de busca moda. Contexto: ocasião={ctx.get('ocasiao')} "
+              f"tipo={ctx.get('tipo_produto')} cores={ctx.get('cores')} "
+              f"estilo={ctx.get('estilo_cliente')} keywords={ctx.get('palavras_chave')} "
+              f"evitar={ctx.get('evitar')} tamanho={ctx.get('tamanho_cliente')}\n"
+              f"Candidatos: {json.dumps(resumo, ensure_ascii=False)}\n"
+              f"Ranqueie os 6 melhores (relevância + diversidade, sem repetir modelo+cor).\n"
+              f"Responda SOMENTE: {{\"ranking\":[idx,idx,idx,idx,idx,idx]}}")
+    try:
+        resp    = gemini.models.generate_content(model=GEMINI_MODEL, contents=prompt,
+                    config=GenerateContentConfig(response_mime_type="application/json"))
+        indices = json.loads(resp.text).get("ranking",[])[:6]
+        result  = [cands[i] for i in indices if 0 <= i < len(cands)]
+        usados  = set(indices)
+        for i, p in enumerate(cands):
+            if len(result) >= 6: break
+            if i not in usados: result.append(p)
+        return result
+    except Exception as e:
+        print(f"⚠️  Re-rank: {e}"); return cands[:6]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CROSS-SELL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cross_sell(estoque: List[Dict], principais: List[Dict], ctx: Dict) -> List[Dict]:
+    tipos_ja = {p.get("_tipo","") for p in principais}
+    ids_ja   = {str(p.get("idProduto","")) for p in principais}
+    tok_sug  = [t for s in ctx.get("sugestao_extra",[]) for t in tokens(s)[:5]]
+    cands    = []
+    for p in estoque:
+        if str(p.get("idProduto","")) in ids_ja or p.get("_tipo","") in tipos_ja: continue
+        sc = sum(3 for t in tok_sug if len(t)>3 and t in p.get("_txt",""))
+        if sc >= 3:
+            c = p.copy(); c["_score"] = sc; c["_cross"] = True; cands.append(c)
+    cands.sort(key=lambda x: -x["_score"]); return cands[:2]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTOR PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def buscar(estoque: List[Dict], ctx: Dict) -> List[Dict]:
+    """
+    Pipeline completo:
+      1. Monta query enriquecida
+      2. Busca vetorial (ChromaDB) se disponível
+      3. Busca BM25 em paralelo
+      4. Fusão RRF
+      5. Fallback heurístico 7 camadas se vetorial não disponível
+      6. Hard filter (termos a evitar)
+      7. Re-rank Gemini (top-12 → top-6)
+      8. Cross-sell para completar
+    """
+    tip_alvo  = n(ctx.get("tipo_produto") or "")
+    evitar    = [n(e) for e in ctx.get("evitar",[]) if len(e) > 3]
+    mapa      = {str(p.get("idProduto","")): p for p in estoque}
+
+    # Query enriquecida
+    q = " ".join(filter(None, [
+        ctx.get("tipo_produto",""),
+        " ".join(ctx.get("cores",[])),
+        " ".join(ctx.get("palavras_chave",[])[:4]),
+        ctx.get("ocasiao",""),
+    ]))
+
+    ranking: List[Tuple[str, float]] = []
+
+    col = get_col()
+    if CHROMA and col and col.count() > 0:
+        vet = await busca_vetorial(q, 25)
+        bm  = busca_bm25(q, 25)
+        rnks = [r for r in [vet, bm] if r]
+        if rnks: ranking = rrf(rnks)
+
+    # Fallback heurístico
+    if not ranking:
+        heur = []
+        for p in estoque:
+            if any(ev in p.get("_txt","") for ev in evitar): continue
+            sc = score(p, ctx)
+            if sc >= (25 if tip_alvo else 15): heur.append((str(p.get("idProduto","")), float(sc)))
+        heur.sort(key=lambda x: -x[1]); ranking = heur
+
+    # Monta candidatos com hard filter
+    cands = []
+    for doc_id, sc in ranking[:12]:
+        p = mapa.get(doc_id)
+        if not p or any(ev in p.get("_txt","") for ev in evitar): continue
+        c = p.copy(); c["_score"] = round(sc, 4); cands.append(c)
+
+    top = await rerank(cands, ctx) if cands else []
+
+    if len(top) < 6:
+        top += cross_sell(estoque, top, ctx)
+
+    # Remove campos internos
+    return [{k: v for k, v in p.items() if not k.startswith("_") or k == "_score"}
+            for p in top[:6]]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEMÓRIA DE SESSÃO
+# ══════════════════════════════════════════════════════════════════════════════
+
+_sessoes: Dict[str, Dict] = {}   # fallback em memória quando Redis indisponível
+_redis   = None
+
+async def get_redis():
+    global _redis
+    if _redis: return _redis
+    if not REDIS: return None
+    try:
+        _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+        await _redis.ping(); print("✅ Redis conectado"); return _redis
+    except Exception as e:
+        print(f"⚠️  Redis: {e}"); _redis = None; return None
+
+async def mesclar_ctx(sid: str, novo: Dict) -> Dict:
+    """Mescla novo contexto com histórico da sessão (Redis ou memória local)."""
+    hist: Dict = {}
+    redis = await get_redis()
+    if redis and sid:
+        try:
+            raw = await redis.get(f"gloria:s:{sid}")
+            hist = json.loads(raw) if raw else {}
+        except Exception: pass
+    elif sid and sid in _sessoes:
+        hist = _sessoes[sid]
+
+    merged = {
+        "ocasiao":        novo.get("ocasiao")        or hist.get("ocasiao","geral"),
+        "tipo_produto":   novo.get("tipo_produto")   or hist.get("tipo_produto"),
+        "cores":          list(set((novo.get("cores") or []) + (hist.get("cores") or []))),
+        "palavras_chave": list(set((novo.get("palavras_chave") or []) + (hist.get("palavras_chave") or []))),
+        "estilo_cliente": novo.get("estilo_cliente") or hist.get("estilo_cliente","casual"),
+        "nivel_decisao":  novo.get("nivel_decisao","explorando"),
+        "intencao":       novo.get("intencao","comprar"),
+        "evitar":         list(set((novo.get("evitar") or []) + (hist.get("evitar") or []))),
+        "sugestao_extra": novo.get("sugestao_extra") or hist.get("sugestao_extra") or [],
+        "tamanho_cliente":novo.get("tamanho_cliente") or hist.get("tamanho_cliente"),
+    }
+
+    if redis and sid:
+        try: await redis.setex(f"gloria:s:{sid}", SESSION_TTL, json.dumps(merged, ensure_ascii=False))
+        except Exception: pass
+    elif sid:
+        _sessoes[sid] = merged
+
+    return merged
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VTEX — ESTOQUE E TAMANHOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_vtex: Dict[str, Dict[str, int]] = {}
+
+async def estoque_vtex(id_p: str) -> Dict[str, int]:
+    if id_p in _vtex: return _vtex[id_p]
+    url = f"{VTEX_BASE}/api/catalog_system/pub/products/search?fq=productId:{id_p}&_from=0&_to=0"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as h:
+            r = await h.get(url, headers={"Accept":"application/json","User-Agent":"GlorIA/2.0"})
+            r.raise_for_status(); dados = r.json()
+    except Exception as e:
+        print(f"⚠️  VTEX estoque {id_p}: {e}"); _vtex[id_p] = {}; return {}
+
+    est: Dict[str, int] = {}
+    try:
+        for item in (dados[0].get("items",[]) if dados else []):
+            tam = None
+            for spec in item.get("variations",[]):
+                if any(x in spec.get("name","").lower() for x in ["tamanho","tam","size","numero"]):
+                    vals = spec.get("values",[]); tam = str(vals[0]) if vals else None; break
+            if not tam:
+                m = re.search(r"\b([3-4][0-9])\b", item.get("name","")); tam = m.group(1) if m else None
+            if not tam: continue
+            qtd = sum(s.get("commertialOffer",{}).get("AvailableQuantity",0) for s in item.get("sellers",[]))
+            if qtd > 1: est[tam] = qtd
+    except Exception as e:
+        print(f"⚠️  Parse VTEX {id_p}: {e}")
+    _vtex[id_p] = est; return est
+
+def tams_desc(desc: str) -> List[str]:
+    txt = html(desc)
+    m   = re.search(r"(?:do\s+(?:tamanho\s+)?|de\s+(?:tamanho\s+)?)(\d{2})(?:\s+(?:ao?|até|a)\s+(?:o\s+)?)(\d{2})", txt, re.I)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if 30 <= a <= 49 and a <= b: return [str(i) for i in range(a, b+1)]
+    nums = re.findall(r"\b([3-4][0-9])\b", txt)
+    return sorted(dict.fromkeys(nums), key=int) if nums else []
+
+async def enriquecer(prods: List[Dict]) -> List[Dict]:
+    for p in prods:
+        try:
+            id_p = str(p.get("idProduto",""))
+            tams: List[str] = []; fonte = "vtex_api"
+            if id_p:
+                ev = await estoque_vtex(id_p)
+                if ev:
+                    try: tams = sorted(ev.keys(), key=lambda x: int(re.sub(r"\D","",x)))
+                    except: tams = sorted(ev.keys())
+            if not tams:
+                tams = tams_desc(p.get("description","")); fonte = "descricao_estimado"
+            p["tamanhos_disponiveis"] = tams; p["tamanhos_fonte"] = fonte
+        except Exception as e:
+            print(f"⚠️  Tam {p.get('idProduto')}: {e}")
+            p.setdefault("tamanhos_disponiveis",[]); p.setdefault("tamanhos_fonte","erro")
+    return prods
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VTEX — ADD TO CART (OrderForm API)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def get_order_form(session: Optional[str]) -> Optional[str]:
+    cookies = {"vtex_session": session} if session else {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as h:
+            r = await h.get(f"{VTEX_BASE}/api/checkout/pub/orderForm",
+                            cookies=cookies, headers={"Accept":"application/json"})
+            return r.json().get("orderFormId")
+    except Exception as e:
+        print(f"⚠️  OrderForm: {e}"); return None
+
+async def sku_ativo(id_sku: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as h:
+            r = await h.get(f"{VTEX_BASE}/api/catalog_system/pub/sku/stockkeepingunitbyid/{id_sku}",
+                            headers={"Accept":"application/json"})
+            return r.json().get("IsActive", False)
+    except: return True  # em dúvida, tenta
+
+async def add_item(ofid: str, id_sku: str, qty: int, session: Optional[str]) -> bool:
+    url     = f"{VTEX_BASE}/api/checkout/pub/orderForm/{ofid}/items"
+    payload = {"orderItems": [{"id": id_sku, "quantity": qty, "seller": "1"}]}
+    cookies = {"vtex_session": session} if session else {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as h:
+            r = await h.post(url, json=payload, cookies=cookies,
+                             headers={"Content-Type":"application/json","Accept":"application/json"})
+            ok = r.status_code in (200, 201)
+            if not ok: print(f"⚠️  Add item {r.status_code}: {r.text[:200]}")
+            return ok
+    except Exception as e:
+        print(f"❌ Add item: {e}"); return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYTICS (log simples em JSONL)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def log(evento: str, dados: Dict, sid: str = "") -> None:
+    try:
+        reg = {"ts": datetime.utcnow().isoformat(), "evento": evento, "sid": sid, "dados": dados}
+        with open("analytics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(reg, ensure_ascii=False) + "\n")
+    except: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERPRETAÇÃO DE INTENÇÃO (Gemini)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def interpretar(texto: Optional[str], img: Optional[bytes]) -> Dict:
+    prompt = """Você é a GlorIA, personal stylist de calçados e bolsas.
+Retorne JSON ESTRITO:
+{"ocasiao":string,"tipo_produto":string|null,"cores":list,"palavras_chave":list,
+ "estilo_cliente":string,"nivel_decisao":"decidida"|"indecisa"|"explorando",
+ "intencao":"comprar"|"inspiracao"|"comparar","evitar":list,"sugestao_extra":list,
+ "tamanho_cliente":string|null}
+Regras: tipo_produto=nome exato PT (mule|scarpin|sandália|sapatilha|tênis|bota|bolsa|mocassim)
+ocasiao=trabalho|casual|festa|praia|esporte|passeio|geral
+cores=inclua implícitas("terra"→"caramelo"), keywords=max 6 termos, estilo=UMA palavra
+sugestao_extra=categorias CURTAS complementares, tamanho_cliente=só se mencionado"""
+    conteudo = [prompt]
+    if texto: conteudo.append(f"Mensagem: {texto}")
+    if img:
+        try: conteudo.append(Image.open(io.BytesIO(img)))
+        except: pass
+    try:
+        r = gemini.models.generate_content(model=GEMINI_MODEL, contents=conteudo,
+                config=GenerateContentConfig(response_mime_type="application/json"))
+        return json.loads(r.text)
+    except Exception as e:
+        print(f"⚠️  Intenção: {e}")
+        return {"ocasiao":"geral","tipo_produto":None,"cores":[],"palavras_chave":["estilo"],
+                "estilo_cliente":"casual","nivel_decisao":"explorando","intencao":"comprar",
+                "evitar":[],"sugestao_extra":[],"tamanho_cliente":None}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HANDLER 422 (file inválido do Swagger/Lovable)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.exception_handler(RequestValidationError)
+async def val_handler(request: Request, exc: RequestValidationError):
+    if all("file" in (e.get("loc") or []) for e in exc.errors()):
+        try:
+            form = await request.form()
+            return JSONResponse(content=await _run(form.get("texto"), None, form.get("session_id")))
+        except Exception as e:
+            print(f"❌ Fallback: {e}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE CENTRAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _run(texto: Optional[str], img: Optional[bytes], sid: Optional[str]) -> dict:
+    estoque = carregar_estoque()
+    ctx_novo = await interpretar(texto, img)
+    ctx      = await mesclar_ctx(sid or "", ctx_novo)
+    prods_raw = await buscar(estoque, ctx)
+    prods     = await enriquecer(prods_raw)
+    await log("busca", {"texto": texto, "tipo": ctx.get("tipo_produto"),
+                         "n": len(prods), "motor": "vetorial" if (CHROMA and _col) else "heuristico"}, sid or "")
+    return {
+        "status":        "sucesso" if prods else "sem_resultados",
+        "interpretacao": ctx,
+        "produtos":      prods,
+        "proxima_acao":  "sugerir_complementos" if ctx.get("nivel_decisao")=="decidida" else "ajudar_decidir",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STARTUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.on_event("startup")
+async def startup():
+    estoque = carregar_estoque()
+    init_bm25(estoque)
+    if CHROMA:
+        await indexar(estoque)
+    await get_redis()
+    print(f"🚀 Motor pronto — BM25={'✅' if BM25 and _bm25 else '❌'} "
+          f"Vetorial={'✅' if CHROMA and _col and _col.count()>0 else '❌'} "
+          f"Redis={'✅' if _redis else '❌'}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/buscar", response_model=RespostaMotor)
+async def buscar_endpoint(
+    texto:      Optional[str]        = Form(None),
+    session_id: Optional[str]        = Form(None),
+    file:       Optional[UploadFile] = File(None),
+):
+    """Busca semântica de produtos."""
+    try:
+        img = None
+        if file and isinstance(file, UploadFile) and file.filename:
+            raw = await file.read(); img = raw or None
+        return await _run(texto, img, session_id)
+    except Exception as e:
+        print(f"❌ /buscar: {e}"); traceback.print_exc()
+        return {"status":"erro","interpretacao":{},"produtos":[],"proxima_acao":"ajudar_decidir"}
+
+
+@app.post("/carrinho/adicionar", response_model=AddCarrinhoResponse)
+async def adicionar_carrinho(req: AddCarrinhoRequest, request: Request):
+    """
+    Adiciona SKU ao carrinho VTEX.
+    Passe o cookie vtex_session no campo session_id.
+    Redirecione o cliente para checkout_url após sucesso.
+    """
+    session = req.session_id or request.cookies.get("vtex_session")
+    try:
+        if not await sku_ativo(req.id_sku):
+            return AddCarrinhoResponse(sucesso=False, mensagem="Produto indisponível.")
+
+        ofid = await get_order_form(session)
+        if not ofid:
+            return AddCarrinhoResponse(sucesso=False, mensagem="Sessão não encontrada. Tente pelo link do produto.")
+
+        if not await add_item(ofid, req.id_sku, req.quantidade, session):
+            return AddCarrinhoResponse(sucesso=False, mensagem="Erro ao adicionar. Tente pelo link do produto.")
+
+        await log("add_cart", {"sku": req.id_sku, "qty": req.quantidade})
+        return AddCarrinhoResponse(
+            sucesso=True,
+            checkout_url=f"{VTEX_BASE}/checkout#/cart",
+            order_form_id=ofid,
+            mensagem="Adicionado ao carrinho! Clique para finalizar 🛒",
+        )
+    except Exception as e:
+        print(f"❌ /carrinho/adicionar: {e}")
+        return AddCarrinhoResponse(sucesso=False, mensagem="Erro interno. Tente pelo link!")
+
+
+@app.get("/carrinho")
+async def ver_carrinho(request: Request):
+    """Resumo do carrinho atual."""
+    session = request.cookies.get("vtex_session")
+    cookies = {"vtex_session": session} if session else {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as h:
+            r = await h.get(f"{VTEX_BASE}/api/checkout/pub/orderForm",
+                            cookies=cookies, headers={"Accept":"application/json"})
+            d = r.json()
+        return {
+            "order_form_id": d.get("orderFormId"),
+            "total_itens":   len(d.get("items",[])),
+            "valor_total":   d.get("value",0)/100,
+            "checkout_url":  f"{VTEX_BASE}/checkout#/cart",
+            "itens": [{"nome":i.get("name"),"quantidade":i.get("quantity"),
+                       "preco":i.get("price",0)/100,"sku":i.get("id")} for i in d.get("items",[])],
+        }
+    except Exception as e:
+        return {"erro": str(e)}
+
+
+@app.get("/tamanhos/{id_produto}")
+async def tamanhos(id_produto: str):
+    """Tamanhos disponíveis em tempo real."""
+    ev = await estoque_vtex(id_produto)
+    if ev:
+        try: return {"id": id_produto, "tamanhos": sorted(ev, key=lambda x: int(re.sub(r"\D","",x))), "fonte":"vtex_api"}
+        except: return {"id": id_produto, "tamanhos": sorted(ev), "fonte":"vtex_api"}
+    estoque = carregar_estoque()
+    p = next((x for x in estoque if str(x.get("idProduto")) == id_produto), None)
+    if p: return {"id": id_produto, "tamanhos": tams_desc(p.get("description","")), "fonte":"descricao_estimado"}
+    return {"id": id_produto, "tamanhos": [], "fonte": "nao_encontrado"}
+
+
+@app.post("/admin/indexar")
+async def admin_indexar():
+    """Re-indexa o catálogo no ChromaDB. Execute uma vez após o deploy."""
+    if not CHROMA: return {"status": "erro", "msg": "pip install chromadb"}
+    n = await indexar(carregar_estoque())
+    return {"status": "ok", "indexados": n}
+
+
+@app.delete("/admin/cache")
+async def admin_cache():
+    """Limpa todos os caches em memória."""
+    global _estoque, _bm25, _bm25_ids, _col
+    _vtex.clear(); _estoque = None; _bm25 = None; _bm25_ids = []; _col = None
+    return {"status": "caches limpos"}
+
+
+@app.get("/health")
+async def health():
+    """Status de todos os componentes."""
+    estoque = carregar_estoque()
+    col     = get_col()
+    return {
+        "status":   "ok",
+        "versao":   "2.0.0",
+        "produtos": len(estoque),
+        "motor": {
+            "bm25":     BM25 and _bm25 is not None,
+            "vetorial": CHROMA and col is not None and col.count() > 0,
+            "redis":    _redis is not None,
+        },
+        "vtex": VTEX_BASE,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
