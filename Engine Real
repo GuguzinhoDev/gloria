@@ -1,0 +1,369 @@
+"""
+Motor de busca híbrido:
+  1. Busca vetorial semântica (ChromaDB + Gemini embeddings)
+  2. Busca BM25 por palavras-chave
+  3. Fusão RRF
+  4. Fallback heurístico com 7 camadas de scoring
+  5. Re-ranking semântico via Gemini
+  6. Cross-sell inteligente
+"""
+import re, json
+from typing import List, Dict, Any, Optional, Tuple
+from collections import defaultdict
+
+from config import GEMINI_MODEL, EMBED_MODEL, CHROMA_PATH, CHROMA_COLLECTION
+from search.lexicon import (
+    SINONIMOS_PRODUTO, SINONIMOS_COR, OCASIAO_CONTEXTO,
+    PALAVRAS_ESTILO, MATERIAIS,
+)
+
+try:
+    import chromadb
+    CHROMA_OK = True
+except ImportError:
+    CHROMA_OK = False
+
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_OK = True
+except ImportError:
+    BM25_OK = False
+
+# ── Estado global ────────────────────────────────────────────────────────────
+_bm25_index: Optional[Any] = None
+_bm25_ids:   List[str]     = []
+_chroma_col: Optional[Any] = None
+
+
+# ── Utils de normalização ────────────────────────────────────────────────────
+
+def norm(txt: str) -> str:
+    import unicodedata
+    if not isinstance(txt, str):
+        return ""
+    txt = unicodedata.normalize("NFD", txt.lower().strip())
+    return "".join(c for c in txt if unicodedata.category(c) != "Mn")
+
+
+def tokenizar(txt: str) -> List[str]:
+    return list(set(re.findall(r"[a-z]{3,}", norm(txt))))
+
+
+def expandir_tipo(tipo: str) -> List[str]:
+    t = norm(tipo)
+    for chave, sins in SINONIMOS_PRODUTO.items():
+        sins_n = [norm(s) for s in sins]
+        if t in sins_n or t == norm(chave):
+            return sins_n
+    return [t]
+
+
+def expandir_cor(cor: str) -> List[str]:
+    c = norm(cor)
+    for chave, sins in SINONIMOS_COR.items():
+        sins_n = [norm(s) for s in sins]
+        if c in sins_n or c == norm(chave):
+            return sins_n
+    return [c]
+
+
+# ── BM25 ─────────────────────────────────────────────────────────────────────
+
+def construir_bm25(estoque: List[Dict]) -> None:
+    global _bm25_index, _bm25_ids
+    if not BM25_OK:
+        return
+    corpus    = [p.get("_tokens", []) for p in estoque]
+    _bm25_ids = [str(p.get("idProduto", i)) for i, p in enumerate(estoque)]
+    _bm25_index = BM25Okapi(corpus)
+    print(f"✅ BM25: {len(_bm25_ids)} docs indexados")
+
+
+def buscar_bm25(query: str, top_k: int = 25) -> List[Tuple[str, float]]:
+    if not _bm25_index:
+        return []
+    scores = _bm25_index.get_scores(tokenizar(query))
+    top    = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+    return [(_bm25_ids[i], float(s)) for i, s in top if s > 0]
+
+
+# ── ChromaDB ─────────────────────────────────────────────────────────────────
+
+def obter_colecao() -> Optional[Any]:
+    global _chroma_col
+    if _chroma_col is not None:
+        return _chroma_col
+    if not CHROMA_OK:
+        return None
+    try:
+        db = chromadb.PersistentClient(path=CHROMA_PATH)
+        _chroma_col = db.get_or_create_collection(
+            name=CHROMA_COLLECTION,
+            metadata={"hnsw:space": "cosine"},
+        )
+        return _chroma_col
+    except Exception as e:
+        print(f"⚠️  ChromaDB: {e}")
+        return None
+
+
+async def indexar_vetorial(estoque: List[Dict], gemini_client: Any) -> int:
+    col = obter_colecao()
+    if col is None:
+        return 0
+
+    ids_existentes = set(col.get(include=[])["ids"])
+    para_indexar   = [p for p in estoque if str(p.get("idProduto","")) not in ids_existentes]
+    if not para_indexar:
+        print(f"✅ Vetorial: {len(ids_existentes)} já indexados")
+        return len(ids_existentes)
+
+    BATCH = 100
+    total = 0
+    for i in range(0, len(para_indexar), BATCH):
+        batch  = para_indexar[i:i + BATCH]
+        textos = [p["_texto_embed"] for p in batch]
+        ids    = [str(p["idProduto"]) for p in batch]
+        metas  = [{"name": p.get("name",""), "tipo": p.get("_tipo",""),
+                   "disponivel": str(p.get("_disponivel", True))} for p in batch]
+        try:
+            resp = gemini_client.models.embed_content(model=EMBED_MODEL, content=textos)
+            embs = [e.values for e in resp.embeddings]
+            col.add(ids=ids, embeddings=embs, documents=textos, metadatas=metas)
+            total += len(batch)
+        except Exception as e:
+            print(f"⚠️  Embedding lote {i}: {e}")
+
+    print(f"✅ Vetorial: {total} produtos indexados")
+    return total
+
+
+async def buscar_vetorial(query: str, top_k: int, gemini_client: Any) -> List[Tuple[str, float]]:
+    col = obter_colecao()
+    if col is None or col.count() == 0:
+        return []
+    try:
+        emb     = gemini_client.models.embed_content(model=EMBED_MODEL, content=query).embeddings[0].values
+        results = col.query(query_embeddings=[emb], n_results=min(top_k, col.count()), include=["distances"])
+        ids     = results["ids"][0]
+        scores  = [1.0 - (d / 2.0) for d in results["distances"][0]]
+        return list(zip(ids, scores))
+    except Exception as e:
+        print(f"⚠️  Busca vetorial: {e}")
+        return []
+
+
+# ── Reciprocal Rank Fusion ────────────────────────────────────────────────────
+
+def rrf(rankings: List[List[Tuple[str, float]]], k: int = 60) -> List[Tuple[str, float]]:
+    scores: Dict[str, float] = defaultdict(float)
+    for ranking in rankings:
+        for pos, (doc_id, _) in enumerate(ranking):
+            scores[doc_id] += 1.0 / (k + pos + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+# ── Scoring heurístico (fallback) ─────────────────────────────────────────────
+
+def score_heuristico(produto: Dict, contexto: Dict) -> int:
+    score   = 0
+    tokens  = set(produto.get("_tokens", []))
+    texto   = produto.get("_texto_limpo", "")
+    ocasiao = norm(contexto.get("ocasiao", "geral"))
+    tipo    = norm(contexto.get("tipo_produto") or "")
+
+    # Tipo — max 60
+    if tipo:
+        for sin in expandir_tipo(tipo):
+            if sin in texto:
+                score += 60 if sin == tipo else 45
+                break
+
+    # Ocasião — max 40
+    ctx = OCASIAO_CONTEXTO.get(ocasiao, OCASIAO_CONTEXTO["geral"])
+    if any(norm(t) in texto for t in ctx["tipos"]):
+        score += 25
+    score += min(sum(1 for e in ctx["estilos"] if norm(e) in texto) * 5, 15)
+    if any(norm(e) in texto for e in ctx["evitar"] if len(e) > 3):
+        score -= 30
+
+    # Cor — max 35
+    pts_cor = 0
+    for cor in contexto.get("cores", []):
+        for tom in expandir_cor(cor):
+            if tom in texto:
+                pts_cor += 35
+                break
+    score += min(pts_cor, 35)
+
+    # Keywords — max 50
+    pts_kw = 0
+    for kw in [norm(k) for k in contexto.get("palavras_chave", [])]:
+        if kw in tokens:
+            pts_kw += 20
+        elif len(kw) > 4 and kw in texto:
+            pts_kw += 10
+        else:
+            for grp, pals in PALAVRAS_ESTILO.items():
+                if kw in [norm(p) for p in pals] and any(norm(p) in tokens for p in pals):
+                    pts_kw += 8
+                    break
+    score += min(pts_kw, 50)
+
+    # Estilo — max 20
+    estilo = norm(contexto.get("estilo_cliente",""))
+    for grp, pals in PALAVRAS_ESTILO.items():
+        if estilo in [norm(p) for p in pals]:
+            if any(norm(p) in tokens for p in pals):
+                score += 20
+            break
+
+    # Material — max 15
+    kws_norm = [norm(k) for k in contexto.get("palavras_chave",[])]
+    for grp, pals in MATERIAIS.items():
+        if any(norm(p) in kws_norm for p in pals) and any(norm(p) in tokens for p in pals):
+            score += 15
+            break
+
+    # Boosts — max 25
+    if produto.get("_disponivel"):   score += 10
+    if produto.get("_tem_desconto"): score += 15
+
+    return score
+
+
+# ── Re-ranking Gemini ─────────────────────────────────────────────────────────
+
+async def rerankar(candidatos: List[Dict], contexto: Dict, gemini_client: Any) -> List[Dict]:
+    if len(candidatos) <= 3:
+        return candidatos[:6]
+
+    resumo = [{
+        "idx":      i,
+        "nome":     p.get("name",""),
+        "categoria":f"{p.get('categoryid1','')} / {p.get('categoryid2','')}",
+        "desc":     re.sub(r"<[^>]+>"," ", p.get("description",""))[:200],
+        "preco":    p.get("price",""),
+        "desconto": p.get("_tem_desconto", False),
+    } for i, p in enumerate(candidatos)]
+
+    prompt = f"""
+Motor de busca de moda. Contexto:
+- Ocasião: {contexto.get("ocasiao")} | Tipo: {contexto.get("tipo_produto")}
+- Cores: {contexto.get("cores")} | Estilo: {contexto.get("estilo_cliente")}
+- Keywords: {contexto.get("palavras_chave")} | Evitar: {contexto.get("evitar")}
+- Tamanho: {contexto.get("tamanho_cliente")}
+
+Candidatos: {json.dumps(resumo, ensure_ascii=False)}
+
+Ranqueie os 6 mais relevantes. Critérios: relevância + diversidade (sem repetir modelo+cor).
+Responda SOMENTE: {{"ranking": [idx, idx, idx, idx, idx, idx]}}
+"""
+    try:
+        from google.genai.types import GenerateContentConfig
+        resp    = gemini_client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt,
+            config=GenerateContentConfig(response_mime_type="application/json"),
+        )
+        indices = json.loads(resp.text).get("ranking", [])[:6]
+        result  = [candidatos[i] for i in indices if 0 <= i < len(candidatos)]
+        usados  = set(indices)
+        for i, p in enumerate(candidatos):
+            if len(result) >= 6:
+                break
+            if i not in usados:
+                result.append(p)
+        return result
+    except Exception as e:
+        print(f"⚠️  Re-rank: {e}")
+        return candidatos[:6]
+
+
+# ── Cross-sell ────────────────────────────────────────────────────────────────
+
+def cross_sell(estoque: List[Dict], principais: List[Dict], contexto: Dict) -> List[Dict]:
+    tipos_ja   = {p.get("_tipo","") for p in principais}
+    ids_ja     = {str(p.get("idProduto","")) for p in principais}
+    tok_sug    = []
+    for s in contexto.get("sugestao_extra",[]):
+        tok_sug.extend(tokenizar(s)[:5])
+
+    candidatos = []
+    for p in estoque:
+        if str(p.get("idProduto","")) in ids_ja or p.get("_tipo","") in tipos_ja:
+            continue
+        sc = sum(3 for t in tok_sug if len(t) > 3 and t in p.get("_texto_limpo",""))
+        if sc >= 3:
+            c = p.copy()
+            c["_score"]      = sc
+            c["_cross_sell"] = True
+            candidatos.append(c)
+
+    candidatos.sort(key=lambda x: x["_score"], reverse=True)
+    return candidatos[:2]
+
+
+# ── Orquestrador principal ────────────────────────────────────────────────────
+
+async def buscar(estoque: List[Dict], contexto: Dict, gemini_client: Any) -> List[Dict]:
+    """Ponto de entrada do motor. Retorna até 6 produtos limpos."""
+    tipo_alvo     = norm(contexto.get("tipo_produto") or "")
+    termos_evitar = [norm(e) for e in contexto.get("evitar",[]) if len(e) > 3]
+
+    # Query enriquecida
+    q_parts = list(filter(None, [
+        contexto.get("tipo_produto",""),
+        " ".join(contexto.get("cores",[])),
+        " ".join(contexto.get("palavras_chave",[])[:4]),
+        contexto.get("ocasiao",""),
+    ]))
+    query = " ".join(q_parts)
+
+    mapa = {str(p.get("idProduto","")): p for p in estoque}
+    ranking_final: List[Tuple[str, float]] = []
+
+    # Tenta busca híbrida
+    col = obter_colecao()
+    if CHROMA_OK and col and col.count() > 0:
+        vet = await buscar_vetorial(query, 25, gemini_client)
+        bm  = buscar_bm25(query, 25)
+        rnks = [r for r in [vet, bm] if r]
+        if rnks:
+            ranking_final = rrf(rnks)
+
+    # Fallback heurístico
+    if not ranking_final:
+        heur = []
+        for p in estoque:
+            if any(ev in p.get("_texto_limpo","") for ev in termos_evitar):
+                continue
+            sc = score_heuristico(p, contexto)
+            if sc >= (25 if tipo_alvo else 15):
+                heur.append((str(p.get("idProduto","")), float(sc)))
+        heur.sort(key=lambda x: x[1], reverse=True)
+        ranking_final = heur
+
+    # Hard filter + mount candidatos
+    candidatos = []
+    for doc_id, sc in ranking_final[:12]:
+        p = mapa.get(doc_id)
+        if not p:
+            continue
+        if any(ev in p.get("_texto_limpo","") for ev in termos_evitar):
+            continue
+        c = p.copy()
+        c["_score"] = round(sc, 4)
+        candidatos.append(c)
+
+    # Re-rank
+    top_6 = await rerankar(candidatos, contexto, gemini_client) if candidatos else []
+
+    # Cross-sell
+    if len(top_6) < 6:
+        top_6 += cross_sell(estoque, top_6, contexto)
+
+    # Limpa campos internos
+    return [
+        {k: v for k, v in p.items() if not k.startswith("_") or k == "_score"}
+        for p in top_6[:6]
+    ]
