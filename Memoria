@@ -1,0 +1,79 @@
+"""Memória de sessão via Redis — contexto conversacional persistente."""
+import json
+from typing import Dict, Optional, Any
+
+from config import REDIS_URL, SESSION_TTL
+
+try:
+    import redis.asyncio as aioredis
+    REDIS_OK = True
+except ImportError:
+    REDIS_OK = False
+
+_client: Optional[Any] = None
+
+
+async def get_client() -> Optional[Any]:
+    global _client
+    if _client is not None:
+        return _client
+    if not REDIS_OK:
+        return None
+    try:
+        _client = await aioredis.from_url(REDIS_URL, decode_responses=True)
+        await _client.ping()
+        print("✅ Redis conectado")
+        return _client
+    except Exception as e:
+        print(f"⚠️  Redis indisponível: {e}")
+        _client = None
+        return None
+
+
+async def mesclar_contexto(session_id: str, novo: Dict) -> Dict:
+    """
+    Combina o novo contexto com o histórico da sessão.
+    Novo prevalece; histórico preenche campos ausentes.
+    """
+    redis = await get_client()
+    hist: Dict = {}
+    if redis and session_id:
+        try:
+            raw = await redis.get(f"gloria:session:{session_id}")
+            hist = json.loads(raw) if raw else {}
+        except Exception:
+            pass
+
+    merged = {
+        "ocasiao":        novo.get("ocasiao")        or hist.get("ocasiao", "geral"),
+        "tipo_produto":   novo.get("tipo_produto")   or hist.get("tipo_produto"),
+        "cores":          list(set((novo.get("cores") or []) + (hist.get("cores") or []))),
+        "palavras_chave": list(set((novo.get("palavras_chave") or []) + (hist.get("palavras_chave") or []))),
+        "estilo_cliente": novo.get("estilo_cliente") or hist.get("estilo_cliente", "casual"),
+        "nivel_decisao":  novo.get("nivel_decisao", "explorando"),
+        "intencao":       novo.get("intencao", "comprar"),
+        "evitar":         list(set((novo.get("evitar") or []) + (hist.get("evitar") or []))),
+        "sugestao_extra": novo.get("sugestao_extra") or hist.get("sugestao_extra") or [],
+        "tamanho_cliente":novo.get("tamanho_cliente") or hist.get("tamanho_cliente"),
+    }
+
+    if redis and session_id:
+        try:
+            await redis.setex(
+                f"gloria:session:{session_id}",
+                SESSION_TTL,
+                json.dumps(merged, ensure_ascii=False),
+            )
+        except Exception:
+            pass
+
+    return merged
+
+
+async def limpar_sessao(session_id: str) -> None:
+    redis = await get_client()
+    if redis:
+        try:
+            await redis.delete(f"gloria:session:{session_id}")
+        except Exception:
+            pass
